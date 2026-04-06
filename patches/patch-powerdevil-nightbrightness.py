@@ -295,14 +295,10 @@ bool NightBrightness::loadAction(const PowerDevil::ProfileSettings &profileSetti
     const bool enabled = group.readEntry("NightBrightnessEnabled", false);
     if (!enabled) {
         if (m_loaded) {
-            qCInfo(POWERDEVIL) << "NightBrightness: disabled, restoring full brightness";
-            // Restore to max brightness on all displays
-            auto *ctrl = core()->screenBrightnessController();
-            for (const QString &id : ctrl->displayIds()) {
-                ctrl->setBrightness(id, ctrl->maxBrightness(id), SOURCE_NAME, u"restore"_s);
-            }
+            qCInfo(POWERDEVIL) << "NightBrightness: disabled";
             m_updateTimer.stop();
             m_loaded = false;
+            // Don't call setBrightness to restore — user adjusts slider themselves
         }
         return false;
     }
@@ -340,13 +336,10 @@ bool NightBrightness::loadAction(const PowerDevil::ProfileSettings &profileSetti
 void NightBrightness::onProfileUnload()
 {
     if (m_loaded) {
-        qCInfo(POWERDEVIL) << "NightBrightness: profile unloaded, restoring full brightness";
-        auto *ctrl = core()->screenBrightnessController();
-        for (const QString &id : ctrl->displayIds()) {
-            ctrl->setBrightness(id, ctrl->maxBrightness(id), SOURCE_NAME, u"restore"_s);
-        }
+        qCInfo(POWERDEVIL) << "NightBrightness: profile unloaded";
         m_updateTimer.stop();
         m_loaded = false;
+        // Don't call setBrightness to restore — avoids DDC/CI contention
     }
 }
 
@@ -372,12 +365,9 @@ void NightBrightness::onUnavailablePoliciesChanged(PowerDevil::PolicyAgent::Requ
     m_inhibitScreen = policies & PowerDevil::PolicyAgent::ChangeScreenSettings;
 
     if (m_inhibitScreen && !wasInhibited) {
-        qCInfo(POWERDEVIL) << "NightBrightness: inhibited, restoring full brightness";
-        auto *ctrl = core()->screenBrightnessController();
-        for (const QString &id : ctrl->displayIds()) {
-            ctrl->setBrightness(id, ctrl->maxBrightness(id), SOURCE_NAME, u"inhibit-restore"_s);
-        }
+        qCInfo(POWERDEVIL) << "NightBrightness: inhibited, pausing";
         m_updateTimer.stop();
+        // Don't restore brightness — user controls it during inhibition
     } else if (!m_inhibitScreen && wasInhibited && m_loaded) {
         qCDebug(POWERDEVIL) << "NightBrightness: inhibition cleared, reapplying";
         applyCurrentBrightness();
@@ -463,6 +453,14 @@ void NightBrightness::applyCurrentBrightness()
     }
 
     const double ratio = computeRatioForTime(QDateTime::currentDateTime());
+
+    // Only touch brightness when dimming — leave it alone during daytime (ratio ~1.0)
+    // This prevents boot-time DDC/CI failures from killing brightness controls
+    if (ratio >= 0.99) {
+        qCInfo(POWERDEVIL) << "NightBrightness: daytime, not touching brightness";
+        scheduleNextUpdate();
+        return;
+    }
 
     // Set absolute DDC/CI brightness on all displays
     auto *ctrl = core()->screenBrightnessController();
