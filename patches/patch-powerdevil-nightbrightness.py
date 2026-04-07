@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Patch PowerDevil to add NightBrightness action.
-Adds time-based DDC/CI brightness scheduling using setDimmingRatio() + KNightTime.
+Adds time-based DDC/CI brightness scheduling using setBrightness() + KNightTime.
+
+v2: Bug fixes — daytime brightness config, deferred first-load, manual override fix,
+    suspend/resume handler, dead code removal.
 
 Usage: python3 patch-powerdevil-nightbrightness.py /path/to/powerdevil-6.6.3/
 """
@@ -47,19 +50,19 @@ def main():
     print("=== Patching PowerDevil for NightBrightness ===\n")
 
     # 1. Create nightbrightness.h
-    print("[1/7] Creating nightbrightness.h")
+    print("[1/5] Creating nightbrightness.h")
     write_file(os.path.join(srcdir, 'daemon', 'actions', 'bundled', 'nightbrightness.h'), NIGHTBRIGHTNESS_H)
 
     # 2. Create nightbrightness.cpp
-    print("[2/7] Creating nightbrightness.cpp")
+    print("[2/5] Creating nightbrightness.cpp")
     write_file(os.path.join(srcdir, 'daemon', 'actions', 'bundled', 'nightbrightness.cpp'), NIGHTBRIGHTNESS_CPP)
 
     # 3. Create plugin JSON
-    print("[3/7] Creating plugin JSON")
+    print("[3/5] Creating plugin JSON")
     write_file(os.path.join(srcdir, 'daemon', 'actions', 'bundled', 'powerdevilnightbrightnessaction.json'), PLUGIN_JSON)
 
     # 4. Patch daemon/actions/bundled/CMakeLists.txt
-    print("[4/7] Patching actions CMakeLists.txt")
+    print("[4/5] Patching actions CMakeLists.txt")
     ok = patch_file(
         os.path.join(srcdir, 'daemon', 'actions', 'bundled', 'CMakeLists.txt'),
         'add_powerdevil_bundled_action(dimdisplay)',
@@ -69,7 +72,7 @@ def main():
         print("  OK")
 
     # 5. Patch top-level CMakeLists.txt — add find_package(KNightTime)
-    print("[5/7] Patching top-level CMakeLists.txt")
+    print("[5/5] Patching top-level CMakeLists.txt")
     ok = patch_file(
         os.path.join(srcdir, 'CMakeLists.txt'),
         'find_package(DDCUtil)',
@@ -77,9 +80,6 @@ def main():
     )
     if ok:
         print("  OK")
-
-    # Steps 6-7 removed: config and UI now live in Night Light KCM (plasma-workspace)
-    # Use patch-plasma-nightbrightness.py for the UI side
 
     print("\n=== Patching complete (daemon only — UI is in plasma-workspace) ===")
     print("Build with: cmake -B build -S . -DCMAKE_INSTALL_LIBEXECDIR=lib -DBUILD_TESTING=OFF && cmake --build build")
@@ -101,7 +101,6 @@ NIGHTBRIGHTNESS_H = r'''/*
 
 #include <QDateTime>
 #include <QTimer>
-#include <optional>
 
 class KDarkLightScheduleProvider;
 
@@ -118,6 +117,9 @@ public:
     bool loadAction(const PowerDevil::ProfileSettings &profileSettings) override;
     bool isSupported() override;
 
+public Q_SLOTS:
+    void onPrepareForSleep(bool sleeping);
+
 protected:
     void onProfileUnload() override;
 
@@ -131,11 +133,12 @@ private Q_SLOTS:
 private:
     void ensureScheduleProvider();
     void applyCurrentBrightness();
+    void applyBrightnessNow(int retriesRemaining = 1);
     void scheduleNextUpdate();
     double computeRatioForTime(const QDateTime &time) const;
-    double effectiveRatio() const;
 
     // Configuration
+    int m_daytimePct = 100;
     int m_bedtimePct = 40;
     int m_lateNightPct = 20;
     int m_bedtimeOffsetMin = 120;
@@ -147,8 +150,12 @@ private:
     KDarkLightScheduleProvider *m_scheduleProvider = nullptr;
     QTimer m_updateTimer;
 
+    // Boot/resume deferred write
+    bool m_resumePending = false;
+
     // Manual override (keybinds)
-    std::optional<double> m_manualOverrideRatio;
+    bool m_manualOverrideActive = false;
+    double m_lastScheduledRatio = 1.0;
 
     // Inhibition
     PowerDevil::PolicyAgent::RequiredPolicies m_inhibitScreen = PowerDevil::PolicyAgent::None;
@@ -179,7 +186,9 @@ NIGHTBRIGHTNESS_CPP = r'''/*
 #include <KPluginFactory>
 
 #include <QAction>
+#include <QDBusConnection>
 #include <QDateTime>
+#include <QPointer>
 #include <algorithm>
 #include <cmath>
 
@@ -206,6 +215,14 @@ NightBrightness::NightBrightness(QObject *parent)
 
     m_updateTimer.setSingleShot(true);
     connect(&m_updateTimer, &QTimer::timeout, this, &NightBrightness::applyCurrentBrightness);
+
+    // Connect to Login1 PrepareForSleep for suspend/resume
+    QDBusConnection::systemBus().connect(
+        u"org.freedesktop.login1"_s,
+        u"/org/freedesktop/login1"_s,
+        u"org.freedesktop.login1.Manager"_s,
+        u"PrepareForSleep"_s,
+        this, SLOT(onPrepareForSleep(bool)));
 
     // Register keybinds: Alt+PgUp / Alt+PgDn for manual brightness override
     auto *actionCollection = new KActionCollection(this);
@@ -251,7 +268,7 @@ void NightBrightness::onIncreaseBrightness()
         int target = std::min(current + step, maxB);
         ctrl->setBrightness(id, target, SOURCE_NAME, u"keybind"_s, ScreenBrightnessController::ShowIndicator);
     }
-    m_manualOverrideRatio = -1.0;  // signal that user overrode
+    m_manualOverrideActive = true;
     qCInfo(POWERDEVIL) << "NightBrightness: keybind increase";
 }
 
@@ -267,15 +284,26 @@ void NightBrightness::onDecreaseBrightness()
         int target = std::max(current - step, ctrl->minBrightness(id));
         ctrl->setBrightness(id, target, SOURCE_NAME, u"keybind"_s, ScreenBrightnessController::ShowIndicator);
     }
-    m_manualOverrideRatio = -1.0;  // signal that user overrode
+    m_manualOverrideActive = true;
     qCInfo(POWERDEVIL) << "NightBrightness: keybind decrease";
 }
 
 void NightBrightness::onDisplayAdded(const QString &displayId)
 {
-    Q_UNUSED(displayId);
-    qCDebug(POWERDEVIL) << "NightBrightness: display added, reapplying";
-    applyCurrentBrightness();
+    if (!m_loaded || m_inhibitScreen) return;
+
+    const double ratio = computeRatioForTime(QDateTime::currentDateTime());
+    auto *ctrl = core()->screenBrightnessController();
+    int maxB = ctrl->maxBrightness(displayId);
+    int target = qRound(maxB * ratio);
+    target = std::clamp(target, ctrl->minBrightness(displayId), maxB);
+    int current = ctrl->brightness(displayId);
+    if (current != target) {
+        ctrl->setBrightness(displayId, target, SOURCE_NAME, u"hotplug"_s,
+                           ScreenBrightnessController::SuppressIndicator);
+        qCInfo(POWERDEVIL) << "NightBrightness: hotplug set" << displayId << "to" << target
+                           << "/" << maxB << "(" << qRound(ratio * 100) << "%)";
+    }
 }
 
 bool NightBrightness::isSupported()
@@ -306,6 +334,7 @@ bool NightBrightness::loadAction(const PowerDevil::ProfileSettings &profileSetti
     // Lazy-init the schedule provider on first real load
     ensureScheduleProvider();
 
+    m_daytimePct = group.readEntry("NightBrightnessDaytimePct", 100);
     m_bedtimePct = group.readEntry("NightBrightnessBedtimePct", 40);
     m_lateNightPct = group.readEntry("NightBrightnessLateNightPct", 20);
     m_bedtimeOffsetMin = group.readEntry("NightBrightnessBedtimeOffsetMin", 120);
@@ -317,16 +346,20 @@ bool NightBrightness::loadAction(const PowerDevil::ProfileSettings &profileSetti
         m_lateNightOffsetMin = m_bedtimeOffsetMin + m_transitionMin;
     }
 
-    qCInfo(POWERDEVIL) << "NightBrightness: loaded — bedtime" << m_bedtimePct << "% at +"
-                       << m_bedtimeOffsetMin << "min, lateNight" << m_lateNightPct << "% at +"
-                       << m_lateNightOffsetMin << "min, transition" << m_transitionMin << "min";
+    qCInfo(POWERDEVIL) << "NightBrightness: loaded — daytime" << m_daytimePct << "%, bedtime"
+                       << m_bedtimePct << "% at +" << m_bedtimeOffsetMin << "min, lateNight"
+                       << m_lateNightPct << "% at +" << m_lateNightOffsetMin << "min, transition"
+                       << m_transitionMin << "min";
 
     // Connect to display hotplug for reapply
     connect(core()->screenBrightnessController(), &ScreenBrightnessController::displayAdded,
             this, &NightBrightness::onDisplayAdded, Qt::UniqueConnection);
 
     // Clear any manual override when config reloads
-    m_manualOverrideRatio.reset();
+    m_manualOverrideActive = false;
+
+    // Boot and config-reload writes are immediate (detection complete before loadAction)
+    // Only onPrepareForSleep sets m_resumePending for resume path
 
     m_loaded = true;
     applyCurrentBrightness();
@@ -374,18 +407,30 @@ void NightBrightness::onUnavailablePoliciesChanged(PowerDevil::PolicyAgent::Requ
     }
 }
 
+void NightBrightness::onPrepareForSleep(bool sleeping)
+{
+    if (!sleeping && m_loaded) {
+        // Waking up — DDC/CI may need re-initialization, defer write
+        m_manualOverrideActive = false;  // pre-sleep override is stale
+        m_resumePending = true;
+        applyCurrentBrightness();
+    }
+}
+
 double NightBrightness::computeRatioForTime(const QDateTime &time) const
 {
+    const double daytimeRatio = m_daytimePct / 100.0;
+
     if (!m_scheduleProvider) {
-        return 1.0;
+        return daytimeRatio;
     }
     const auto schedule = m_scheduleProvider->schedule();
     const auto prevTransition = schedule.previousTransition(time);
     const auto nextTransition = schedule.nextTransition(time);
 
     if (!prevTransition || !nextTransition) {
-        // Extreme latitude — no sunrise/sunset. Stay at full brightness.
-        return 1.0;
+        // Extreme latitude — no sunrise/sunset. Return configured daytime brightness.
+        return daytimeRatio;
     }
 
     const double bedtimeRatio = m_bedtimePct / 100.0;
@@ -394,25 +439,43 @@ double NightBrightness::computeRatioForTime(const QDateTime &time) const
     // Check if we're in an evening transition (sunset in progress)
     if (nextTransition->type() == KDarkLightTransition::Evening
         && nextTransition->test(time) == KDarkLightTransition::InProgress) {
-        // Sunset is happening now — start dimming
+        // Sunset is happening now — start dimming from daytime to bedtime
         const double progress = nextTransition->progress(time);
-        return std::lerp(1.0, bedtimeRatio, progress);
+        return std::lerp(daytimeRatio, bedtimeRatio, progress);
     }
 
     // Check if we're in a morning transition (sunrise in progress)
     if (nextTransition->type() == KDarkLightTransition::Morning
         && nextTransition->test(time) == KDarkLightTransition::InProgress) {
-        // Sunrise is happening now — brightening
+        // Sunrise is happening now — compute actual pre-sunrise nighttime ratio
         const double progress = nextTransition->progress(time);
-        return std::lerp(lateNightRatio, 1.0, progress);
+
+        const QDateTime sunriseStart = nextTransition->startDateTime();
+        const qint64 nightDuration = prevTransition->endDateTime().secsTo(sunriseStart);
+        const qint64 bedtimeStartSecs = m_bedtimeOffsetMin * 60;
+        const qint64 lateTransitionStart = m_lateNightOffsetMin * 60 - m_transitionMin * 60;
+        const qint64 lateNightStartSecs = m_lateNightOffsetMin * 60;
+
+        double preSunriseRatio;
+        if (nightDuration < bedtimeStartSecs) {
+            preSunriseRatio = bedtimeRatio;  // never left post-sunset hold
+        } else if (nightDuration < lateTransitionStart) {
+            preSunriseRatio = bedtimeRatio;  // in extended bedtime hold
+        } else if (nightDuration < lateNightStartSecs) {
+            double p = double(nightDuration - lateTransitionStart) / double(m_transitionMin * 60);
+            preSunriseRatio = std::lerp(bedtimeRatio, lateNightRatio, std::clamp(p, 0.0, 1.0));
+        } else {
+            preSunriseRatio = lateNightRatio;  // normal case
+        }
+        return std::lerp(preSunriseRatio, daytimeRatio, progress);
     }
 
-    // If previous transition was morning → we're in daytime
+    // If previous transition was morning -> we're in daytime
     if (prevTransition->type() == KDarkLightTransition::Morning) {
-        return 1.0;
+        return daytimeRatio;
     }
 
-    // Previous transition was evening → we're in nighttime
+    // Previous transition was evening -> we're in nighttime
     // Calculate position within the nighttime tier system
     const QDateTime sunsetEnd = prevTransition->endDateTime();
     const qint64 secsSinceSunset = sunsetEnd.secsTo(time);
@@ -422,17 +485,23 @@ double NightBrightness::computeRatioForTime(const QDateTime &time) const
 
     if (secsSinceSunset < 0) {
         // Should not happen, but safety
-        return 1.0;
+        return daytimeRatio;
     }
 
-    // Phase 1: Post-sunset hold at bedtime level (evening transition already handled above)
+    // Phase 1: Post-sunset hold at bedtime level
     if (secsSinceSunset < bedtimeStartSecs) {
         return bedtimeRatio;
     }
 
-    // Phase 2: Bedtime → late-night transition
-    if (secsSinceSunset < bedtimeStartSecs + transitionSecs) {
-        const double progress = double(secsSinceSunset - bedtimeStartSecs) / double(transitionSecs);
+    // Phase 1.5: Extended bedtime hold (gap between bedtime and late-night transition)
+    const qint64 lateTransitionStart = lateNightStartSecs - transitionSecs;
+    if (secsSinceSunset < lateTransitionStart) {
+        return bedtimeRatio;
+    }
+
+    // Phase 2: Bedtime -> late-night transition (ends at lateNightStartSecs)
+    if (secsSinceSunset < lateNightStartSecs) {
+        const double progress = double(secsSinceSunset - lateTransitionStart) / double(transitionSecs);
         return std::lerp(bedtimeRatio, lateNightRatio, std::clamp(progress, 0.0, 1.0));
     }
 
@@ -446,36 +515,76 @@ void NightBrightness::applyCurrentBrightness()
         return;
     }
 
-    // If user manually overrode (keybind or slider), skip until next tier boundary
-    if (m_manualOverrideRatio.has_value()) {
-        // Clear override if we haven't already and schedule changed enough
-        m_manualOverrideRatio.reset();
+    // Manual override logic: if user adjusted via keybind, skip until tier boundary
+    if (m_manualOverrideActive) {
+        double currentRatio = computeRatioForTime(QDateTime::currentDateTime());
+        if (std::abs(currentRatio - m_lastScheduledRatio) > KEYBIND_STEP) {
+            m_manualOverrideActive = false;  // tier boundary crossed, clear override
+        } else {
+            scheduleNextUpdate();
+            return;  // preserve user's manual adjustment
+        }
     }
 
     const double ratio = computeRatioForTime(QDateTime::currentDateTime());
+    m_lastScheduledRatio = ratio;
 
-    // Only touch brightness when dimming — leave it alone during daytime (ratio ~1.0)
-    // This prevents boot-time DDC/CI failures from killing brightness controls
-    if (ratio >= 0.99) {
-        qCInfo(POWERDEVIL) << "NightBrightness: daytime, not touching brightness";
+    // Resume from suspend: defer briefly for DDC/CI reinitialization
+    if (m_resumePending) {
+        m_resumePending = false;
+        QTimer::singleShot(std::chrono::milliseconds(1500), this,
+            [this, guard = QPointer(this)]() {
+                if (!guard || !m_loaded || m_inhibitScreen) return;
+                applyBrightnessNow();
+            });
+        qCInfo(POWERDEVIL) << "NightBrightness: resume, deferring"
+                           << qRound(ratio * 100) << "% apply by 1.5s";
         scheduleNextUpdate();
         return;
     }
 
-    // Set absolute DDC/CI brightness on all displays
+    // Steady-state: apply immediately
+    applyBrightnessNow();
+    scheduleNextUpdate();
+}
+
+void NightBrightness::applyBrightnessNow(int retriesRemaining)
+{
+    if (m_manualOverrideActive) return;  // user took control during delay
+    if (!m_loaded || m_inhibitScreen) return;
+
+    const double ratio = computeRatioForTime(QDateTime::currentDateTime());
+    m_lastScheduledRatio = ratio;  // keep override baseline current
+
     auto *ctrl = core()->screenBrightnessController();
+    if (!ctrl) return;
     const auto ids = ctrl->displayIds();
+
+    if (ids.isEmpty()) {
+        if (retriesRemaining > 0) {
+            QTimer::singleShot(std::chrono::milliseconds(1500), this,
+                [this, guard = QPointer(this), retriesRemaining]() {
+                    if (!guard || !m_loaded) return;
+                    applyBrightnessNow(retriesRemaining - 1);
+                });
+            qCInfo(POWERDEVIL) << "NightBrightness: no displays yet, retrying in 5s";
+        } else {
+            qCWarning(POWERDEVIL) << "NightBrightness: no displays after retries, giving up";
+        }
+        return;
+    }
+
     for (const QString &id : ids) {
         int maxB = ctrl->maxBrightness(id);
         int target = qRound(maxB * ratio);
         target = std::clamp(target, ctrl->minBrightness(id), maxB);
-        qCInfo(POWERDEVIL) << "NightBrightness: setting" << id << "to" << target << "/" << maxB
-                           << "(" << qRound(ratio * 100) << "%)";
+        int current = ctrl->brightness(id);
+        if (current == target) continue;  // skip redundant DDC/CI write
         ctrl->setBrightness(id, target, SOURCE_NAME, u"scheduled"_s,
                            ScreenBrightnessController::SuppressIndicator);
+        qCInfo(POWERDEVIL) << "NightBrightness: set" << id << "to" << target
+                           << "/" << maxB << "(" << qRound(ratio * 100) << "%)";
     }
-
-    scheduleNextUpdate();
 }
 
 void NightBrightness::scheduleNextUpdate()
@@ -525,11 +634,6 @@ PLUGIN_JSON = '''{
     "X-KDE-PowerDevil-Action-ID": "NightBrightness"
 }
 '''
-
-
-# KCFG_ENTRIES and KCM_QML removed — config and UI now in plasma-workspace Night Light KCM
-# Use patch-plasma-nightbrightness.py for the UI side
-
 
 
 if __name__ == '__main__':

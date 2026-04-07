@@ -3,6 +3,8 @@
 Patch plasma-workspace Night Light KCM to add Night Brightness controls.
 Adds time-based brightness scheduling UI alongside color temperature controls.
 
+v2: Added daytime brightness slider and config entry.
+
 Usage: python3 patch-plasma-nightbrightness.py /path/to/plasma-workspace-6.6.3/
 """
 
@@ -38,7 +40,7 @@ def main():
     print("=== Patching plasma-workspace Night Light KCM ===\n")
 
     # 1. Add brightness entries to nightlightsettings.kcfg
-    print("[1/2] Patching nightlightsettings.kcfg")
+    print("[1/4] Patching nightlightsettings.kcfg")
     ok = patch_file(kcfg,
         '        <entry name="NightTemperature" type="Int">',
         KCFG_ENTRIES + '        <entry name="NightTemperature" type="Int">')
@@ -46,7 +48,7 @@ def main():
         print("  OK")
 
     # 2. Add brightness controls to main.qml
-    print("[2/2] Patching main.qml")
+    print("[2/4] Patching main.qml")
     # Insert after the night temperature GridLayout, before FormLayout closes
     # Anchor: the unique end of the night temperature section
     ok = patch_file(qml,
@@ -73,6 +75,24 @@ def main():
     if ok:
         print("  OK")
 
+    # 3. Add save() override to kcm.h
+    kcm_h = os.path.join(srcdir, 'kcms', 'nightlight', 'kcm.h')
+    print("[3/4] Patching kcm.h")
+    ok = patch_file(kcm_h,
+        'Q_INVOKABLE void stopPreview();',
+        'Q_INVOKABLE void stopPreview();\n\n    void save() override;')
+    if ok:
+        print("  OK")
+
+    # 4. Add save() implementation to kcm.cpp
+    kcm_cpp = os.path.join(srcdir, 'kcms', 'nightlight', 'kcm.cpp')
+    print("[4/4] Patching kcm.cpp")
+    ok = patch_file(kcm_cpp,
+        '}\n}\n#include "kcm.moc"',
+        '}\n\nvoid KCMNightLight::save()\n{\n    KQuickManagedConfigModule::save();\n\n    // Notify PowerDevil to reload NightBrightness config immediately\n    auto call = QDBusMessage::createMethodCall(\n        u"org.kde.Solid.PowerManagement"_s,\n        u"/org/kde/Solid/PowerManagement"_s,\n        u"org.kde.Solid.PowerManagement"_s,\n        u"refreshStatus"_s);\n    QDBusConnection::sessionBus().send(call);\n}\n}\n#include "kcm.moc"')
+    if ok:
+        print("  OK")
+
     print("\n=== Patching complete ===")
 
 
@@ -83,6 +103,10 @@ def main():
 KCFG_ENTRIES = '''        <!-- Night Brightness settings -->
         <entry name="NightBrightnessEnabled" type="Bool">
             <default>false</default>
+        </entry>
+        <entry name="NightBrightnessDaytimePct" type="Int">
+            <default>100</default>
+            <min>5</min><max>100</max>
         </entry>
         <entry name="NightBrightnessBedtimePct" type="Int">
             <default>40</default>
@@ -121,6 +145,48 @@ QML_CONTROLS = '''
                     settingName: "NightBrightnessEnabled"
                     extraEnabledConditions: kcm.nightLightSettings.active
                 }
+            }
+
+            GridLayout {
+                Kirigami.FormData.label: i18nc("@label:slider", "Daytime brightness:")
+                Kirigami.FormData.buddyFor: daytimeSlider
+                enabled: kcm.nightLightSettings.active && kcm.nightLightSettings.nightBrightnessEnabled
+                columns: 4
+
+                QQC2.Slider {
+                    id: daytimeSlider
+                    Layout.minimumWidth: modeSwitcher.width
+                    Layout.columnSpan: 3
+                    from: 100
+                    to: 5
+                    stepSize: -5
+                    live: true
+                    value: kcm.nightLightSettings.nightBrightnessDaytimePct
+                    onMoved: kcm.nightLightSettings.nightBrightnessDaytimePct = value
+
+                    KCM.SettingStateBinding {
+                        configObject: kcm.nightLightSettings
+                        settingName: "NightBrightnessDaytimePct"
+                        extraEnabledConditions: kcm.nightLightSettings.active && kcm.nightLightSettings.nightBrightnessEnabled
+                    }
+                }
+                QQC2.Label {
+                    text: i18nc("Brightness percentage", "%1%", daytimeSlider.value)
+                    textFormat: Text.PlainText
+                    horizontalAlignment: Text.AlignRight
+                    Layout.minimumWidth: sliderValueLabelMetrics.implicitWidth
+                }
+                //row 2
+                QQC2.Label {
+                    text: i18nc("@info:label Slider end label for maximum brightness", "Bright")
+                    textFormat: Text.PlainText
+                }
+                Item { Layout.fillWidth: true }
+                QQC2.Label {
+                    text: i18nc("@info:label Slider end label for minimum brightness", "Dim")
+                    textFormat: Text.PlainText
+                }
+                Item {}
             }
 
             GridLayout {

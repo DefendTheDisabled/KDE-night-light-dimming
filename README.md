@@ -8,16 +8,16 @@ Automatic DDC/CI hardware brightness scheduling for KDE Plasma, integrated into 
 
 Night Light already shifts color temperature at sunset. This adds **hardware brightness dimming** to the same schedule:
 
-- **Daytime**: Full brightness (100%)
+- **Daytime**: Configurable brightness (default 100%) — applied at boot and sunrise
 - **Bedtime** (configurable, default 2h after sunset): Reduced brightness (default 40%)
 - **Late night** (configurable, default 3h after sunset): Low brightness (default 20%)
-- **Sunrise**: Gradual return to full brightness
+- **Sunrise**: Gradual return to daytime brightness
 
 Transitions are smooth — brightness changes in small steps over configurable durations (default 30 minutes per transition).
 
 ### Manual Override
 
-**Alt+PgUp / Alt+PgDn** adjust brightness at any time. Scheduled dimming resumes at the next transition boundary.
+**Alt+PgUp / Alt+PgDn** adjust brightness at any time. Scheduled dimming resumes when the brightness curve moves to the next tier.
 
 ## How It Works
 
@@ -127,11 +127,12 @@ All settings are in `~/.config/kwinrc` under `[NightColor]`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `NightBrightnessEnabled` | false | Master enable |
+| `NightBrightnessDaytimePct` | 100 | Daytime brightness (% of max) — applied at boot/sunrise |
 | `NightBrightnessBedtimePct` | 40 | Bedtime brightness (% of max) |
 | `NightBrightnessLateNightPct` | 20 | Late night brightness (% of max) |
 | `NightBrightnessBedtimeOffsetMin` | 120 | Minutes after sunset for bedtime |
 | `NightBrightnessLateNightOffsetMin` | 180 | Minutes after sunset for late night |
-| `NightBrightnessTransitionMin` | 30 | Transition ramp duration (minutes) |
+| `NightBrightnessTransitionMin` | 30 | Bedtime-to-late-night transition ramp duration (minutes) |
 
 ## Keyboard Shortcuts
 
@@ -166,8 +167,10 @@ This implementation uses `setBrightness()` directly, which goes through the work
 - `CMakeLists.txt` (KNightTime dependency)
 
 **plasma-workspace:**
-- `kcms/nightlight/nightlightsettings.kcfg` (6 new config entries)
+- `kcms/nightlight/nightlightsettings.kcfg` (7 new config entries)
 - `kcms/nightlight/ui/main.qml` (brightness controls)
+- `kcms/nightlight/kcm.h` (`save()` override declaration)
+- `kcms/nightlight/kcm.cpp` (`save()` implementation — notifies PowerDevil to reload on Apply)
 
 ## License
 
@@ -179,12 +182,20 @@ Sean Smith (DefendTheDisabled) — developed with AI agent assistance (OpenCode 
 
 ## Status
 
-**Working on local deployment** (EndeavourOS, KDE Plasma 6.6.3, Dell U2724D via HDMI, NVIDIA RTX 5060 Ti).
+**Deployed and verified** (EndeavourOS, KDE Plasma 6.6.3, Dell U2724D via HDMI, NVIDIA RTX 5060 Ti). Day/night cycle verified. Config changes apply immediately.
 
-Awaiting real-world day/night cycle verification before upstream submission to KDE.
+### Merge Requests
 
-### Upstream Path
+- **PowerDevil**: [plasma/powerdevil!623](https://invent.kde.org/plasma/powerdevil/-/merge_requests/623)
+- **plasma-workspace**: [plasma/plasma-workspace!6472](https://invent.kde.org/plasma/plasma-workspace/-/merge_requests/6472)
 
-1. KDE Discuss — feature proposal and community feedback
-2. bugs.kde.org — feature enhancement request
-3. invent.kde.org — merge requests to `plasma/powerdevil` and `plasma/plasma-workspace`
+### Changelog (v2)
+
+- **Configurable daytime brightness** — new `NightBrightnessDaytimePct` setting (default 100%). Users set their preferred daytime level instead of hardcoded 100%.
+- **Instant boot brightness** — eliminated 5-second boot delay. Brightness applies immediately on login (PowerDevil initialization sequence guarantees DDC/CI readiness).
+- **Config changes apply immediately** — KCM `save()` now notifies PowerDevil via D-Bus `refreshStatus()`. No need to re-login after changing settings.
+- **Fixed manual override** — keybind overrides now persist until the brightness curve reaches the next tier, instead of being overwritten on the next timer tick.
+- **Fixed `lateNightOffsetMin`** — config value was displayed in UI but silently ignored. Late-night now starts at the configured time.
+- **Short-night sunrise fix** — morning transition now lerps from the actual pre-sunrise brightness, not always from late-night level.
+- **Suspend/resume support** — brightness re-applied after wake with 1.5s DDC/CI reinitialization delay.
+- **Removed dead code** — `effectiveRatio()` declaration removed.
