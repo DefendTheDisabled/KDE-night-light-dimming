@@ -4,7 +4,7 @@ Automatic brightness scheduling for KDE Plasma, integrated into the Night Light 
 
 Supports two brightness paths: **software brightness** via KWin's compositor pipeline (default) and **DDC/CI hardware brightness** when enabled in Display Configuration.
 
-![Night Light settings with brightness controls](screenshots/night-light-settings.png)
+![Night Light settings with brightness controls](https://github.com/DefendTheDisabled/KDE-night-light-dimming/blob/main/screenshots/night-light-settings.png?raw=true)
 
 ## What It Does
 
